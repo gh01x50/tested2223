@@ -67,6 +67,11 @@ Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 Object.defineProperty(navigator, 'languages', {get: () => ['pl-PL','pl','en-US','en']});
 Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
 window.chrome = window.chrome || { runtime: {} };
+document.hasFocus = () => true;
+try {
+  Object.defineProperty(document, 'visibilityState', {get: () => 'visible'});
+  Object.defineProperty(document, 'hidden', {get: () => false});
+} catch (e) {}
 const _q = window.navigator.permissions.query;
 window.navigator.permissions.query = (p) => p.name === 'notifications'
   ? Promise.resolve({state: Notification.permission}) : _q(p);
@@ -91,7 +96,6 @@ def is_vod(url):
 
 
 async def click_el(page, el):
-    """Klik przez współrzędne - omija sprawdzanie stabilności, zostawia realny gest."""
     try:
         await el.scroll_into_view_if_needed(timeout=3000)
     except Exception:
@@ -151,6 +155,15 @@ async def playback_pos(page):
         return -2
 
 
+async def diagnostics(page):
+    try:
+        return await page.evaluate(
+            "() => [document.visibilityState, document.hasFocus()]"
+        )
+    except Exception:
+        return ["?", "?"]
+
+
 async def try_unmute(page):
     try:
         btn = await page.query_selector(".sp-unmute")
@@ -163,15 +176,55 @@ async def try_unmute(page):
     return False
 
 
+async def wait_adlayer(page, idx, timeout=12000):
+    """Czeka na pre-roll i go obsługuje. Zwraca True, jeśli warstwa była."""
+    try:
+        await page.wait_for_selector(".adlayer", timeout=timeout)
+    except Exception:
+        return False
+    log(f"  .adlayer wykryty")
+    await page.wait_for_timeout(random.randint(7000, 12000))
+    for sel in (".adlayer .skip", ".adlayer .sk", ".adlayer button", ".adlayer .x"):
+        try:
+            btn = await page.query_selector(sel)
+            if btn and await btn.is_visible():
+                if await click_el(page, btn):
+                    log(f"  pominięto reklamę ({sel})")
+                    break
+        except Exception:
+            continue
+    try:
+        await page.screenshot(path=str(ART / f"ad-{idx}.png"))
+    except Exception:
+        pass
+    return True
+
+
+async def adlayer_clear(page, timeout=15000):
+    try:
+        await page.wait_for_selector(".adlayer", state="detached", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+async def click_when_ready(page, el, label):
+    """Klik tylko, gdy nie wisi warstwa reklamowa."""
+    if await page.query_selector(".adlayer"):
+        await adlayer_clear(page)
+    ok = await click_el(page, el)
+    log(f"  klik w {label}: {'ok' if ok else 'nieudany'}")
+    return ok
+
+
 async def switch_channel(page):
     try:
         items = await page.query_selector_all("#list .ev")
         if len(items) < 2:
             return False
-        el = random.choice(items)
-        if not await click_el(page, el):
+        if not await click_when_ready(page, random.choice(items), "kanał"):
             return False
-        await page.wait_for_timeout(random.randint(2000, 5000))
+        await page.wait_for_timeout(random.randint(1500, 3500))
         title = await page.text_content("#evTitle")
         log(f"  przełączono kanał -> {title!r}")
         return True
@@ -181,7 +234,6 @@ async def switch_channel(page):
 
 
 async def start_episode(page):
-    """VOD: wejdź w odcinek, żeby odtwarzacz powstał."""
     cards = await page.query_selector_all(
         "#rseries .rcard, .rgrid .rcard, #replayGrid .rcard:not(.rser)"
     )
@@ -190,14 +242,18 @@ async def start_episode(page):
     if not cards:
         log("  brak odcinków do kliknięcia")
         return False
-    ok = await click_el(page, random.choice(cards[:10]))
-    log(f"  klik w odcinek: {'ok' if ok else 'nieudany'}")
-    await page.wait_for_timeout(random.randint(2500, 5000))
-    return ok
+    if not await click_when_ready(page, random.choice(cards[:10]), "odcinek"):
+        return False
+    await page.wait_for_timeout(random.randint(2000, 4000))
+    return True
 
 
 async def try_click(page):
-    for sel in ("#playerBox video", "#playerBox", ".actions .btn", ".title-row", ".below"):
+    """Klik w treść (nie w .adlayer) - odpala popup/vignette."""
+    if await page.query_selector(".adlayer"):
+        log("  .adlayer zajęty, klik pominięty")
+        return
+    for sel in ("#playerBox video", ".actions .btn", ".title-row", ".below", "nav .logo"):
         try:
             el = await page.query_selector(sel)
             if el and await el.is_visible():
@@ -253,7 +309,9 @@ async def visit(browser, idx):
     await ctx.add_init_script(STEALTH)
 
     page = await ctx.new_page()
-    ad_hits, extra, steps = set(), 0, 0
+    await page.bring_to_front()
+
+    ad_hits, extra, steps, adlayers = set(), 0, 0, 0
 
     def on_page(_pg):
         nonlocal extra
@@ -280,13 +338,21 @@ async def visit(browser, idx):
         log(f"[{idx}] lista nie pojawiła się w 25s")
 
     await page.wait_for_timeout(random.randint(3000, 6000))
+    await page.bring_to_front()
+    log(f"[{idx}] visibility/focus: {await diagnostics(page)}")
 
+    # pierwsze wejście w materiał - tu startuje pre-roll
     if vod:
-        await start_episode(page)
+        if await start_episode(page):
+            if await wait_adlayer(page, idx):
+                adlayers += 1
         try:
             await page.wait_for_selector("#playerBox video", timeout=15000)
         except Exception:
             log(f"[{idx}] brak elementu video po wejściu w odcinek")
+    else:
+        if await wait_adlayer(page, idx, timeout=8000):
+            adlayers += 1
 
     await try_unmute(page)
     await jiggle_mouse(page)
@@ -304,8 +370,10 @@ async def visit(browser, idx):
         if not ok:
             break
         steps += 1
+        if await wait_adlayer(page, idx):
+            adlayers += 1
         await try_unmute(page)
-        await page.wait_for_timeout(random.randint(8000, 20000))
+        await page.wait_for_timeout(random.randint(6000, 15000))
         if random.random() < 0.4:
             await try_click(page)
             await page.wait_for_timeout(random.randint(3000, 7000))
@@ -313,22 +381,9 @@ async def visit(browser, idx):
     await human_scroll(page)
     await page.wait_for_timeout(random.randint(5000, 12000))
 
-    slots = {}
-    for sel in ("#navAd", "#sideAd"):
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                inner = (await el.inner_html()).strip()
-                frames = await el.query_selector_all("iframe")
-                slots[sel] = bool(inner) or bool(frames)
-            else:
-                slots[sel] = False
-        except Exception:
-            slots[sel] = False
     ad_frames = [f for f in page.frames if any(p in (f.url or "").lower() for p in AD_PATTERNS)]
-
     log(f"[{idx}] hosty reklamowe: {sorted(ad_hits)[:8] or 'BRAK'}")
-    log(f"[{idx}] ramki reklamowe w DOM: {len(ad_frames)} | sloty: {slots}")
+    log(f"[{idx}] ramki reklamowe: {len(ad_frames)} | warstwy .adlayer: {adlayers}")
     log(f"[{idx}] popundery: {extra} | kroki: {steps}")
 
     try:
@@ -347,7 +402,6 @@ async def main():
             headless=HEADLESS,
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
                 "--autoplay-policy=no-user-gesture-required",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
