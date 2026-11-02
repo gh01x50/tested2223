@@ -58,7 +58,8 @@ REFERRERS = [
 
 AD_PATTERNS = [
     "al5sm.com", "n6wxm.com", "quge5.com", "monetag", "libtl.com",
-    "vignette", "googlesyndication", "doubleclick", "effectivegatecpm",
+    "vignette", "255md.com", "60po.com", "ekhay.com",
+    "googlesyndication", "doubleclick", "effectivegatecpm",
 ]
 
 STEALTH = """
@@ -77,7 +78,6 @@ def log(msg):
 
 
 def with_cachebust(url):
-    """Wstawia ?v= PRZED fragmentem #, żeby nie zepsuć routingu SPA."""
     if not CACHEBUST:
         return url
     base, _, frag = url.partition("#")
@@ -88,6 +88,37 @@ def with_cachebust(url):
 
 def is_vod(url):
     return "/vod/" in urlparse(url).path
+
+
+async def click_el(page, el):
+    """Klik przez współrzędne - omija sprawdzanie stabilności, zostawia realny gest."""
+    try:
+        await el.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    try:
+        box = await el.bounding_box()
+    except Exception:
+        box = None
+    if box and box["width"] > 2 and box["height"] > 2:
+        try:
+            await page.mouse.click(
+                box["x"] + box["width"] * random.uniform(0.3, 0.7),
+                box["y"] + box["height"] * random.uniform(0.3, 0.7),
+            )
+            return True
+        except Exception:
+            pass
+    try:
+        await el.click(timeout=2500, force=True)
+        return True
+    except Exception:
+        pass
+    try:
+        await el.dispatch_event("click")
+        return True
+    except Exception:
+        return False
 
 
 async def human_scroll(page):
@@ -124,23 +155,22 @@ async def try_unmute(page):
     try:
         btn = await page.query_selector(".sp-unmute")
         if btn and await btn.is_visible():
-            await btn.click(timeout=4000)
-            log("  odciszono odtwarzacz")
-            return True
+            if await click_el(page, btn):
+                log("  odciszono odtwarzacz")
+                return True
     except Exception:
         pass
     return False
 
 
 async def switch_channel(page):
-    """Tryb LIVE: przełączenie kanału w panelu bocznym."""
     try:
         items = await page.query_selector_all("#list .ev")
         if len(items) < 2:
             return False
         el = random.choice(items)
-        await el.scroll_into_view_if_needed(timeout=5000)
-        await el.click(timeout=6000)
+        if not await click_el(page, el):
+            return False
         await page.wait_for_timeout(random.randint(2000, 5000))
         title = await page.text_content("#evTitle")
         log(f"  przełączono kanał -> {title!r}")
@@ -150,33 +180,30 @@ async def switch_channel(page):
         return False
 
 
-async def open_vod_item(page):
-    """Tryb VOD: klik w kartę serialu / odcinek."""
-    try:
-        for sel in ("#rseries .rcard", "#replayGrid .rcard:not(.rser)", "#replayGrid .rcard"):
-            items = await page.query_selector_all(sel)
-            if not items:
-                continue
-            el = random.choice(items[:12])
-            await el.scroll_into_view_if_needed(timeout=5000)
-            await el.click(timeout=6000)
-            await page.wait_for_timeout(random.randint(3000, 6000))
-            log(f"  otwarto kartę VOD ({sel})")
-            return True
-    except Exception as e:
-        log(f"  karta VOD nieudana: {type(e).__name__}")
-    return False
+async def start_episode(page):
+    """VOD: wejdź w odcinek, żeby odtwarzacz powstał."""
+    cards = await page.query_selector_all(
+        "#rseries .rcard, .rgrid .rcard, #replayGrid .rcard:not(.rser)"
+    )
+    if not cards:
+        cards = await page.query_selector_all("#replayGrid .rcard")
+    if not cards:
+        log("  brak odcinków do kliknięcia")
+        return False
+    ok = await click_el(page, random.choice(cards[:10]))
+    log(f"  klik w odcinek: {'ok' if ok else 'nieudany'}")
+    await page.wait_for_timeout(random.randint(2500, 5000))
+    return ok
 
 
 async def try_click(page):
-    """Klik w player lub element strony - odpala vignette/popunder."""
-    for sel in ("#playerBox", ".actions .btn", ".title-row", ".below", "#replayGrid .rcard"):
+    for sel in ("#playerBox video", "#playerBox", ".actions .btn", ".title-row", ".below"):
         try:
             el = await page.query_selector(sel)
             if el and await el.is_visible():
-                await el.click(timeout=4000)
-                log(f"  klik w {sel}")
-                return
+                if await click_el(page, el):
+                    log(f"  klik w {sel}")
+                    return
         except Exception:
             continue
     try:
@@ -246,18 +273,24 @@ async def visit(browser, idx):
     log(f"[{idx}] -> {url} | tryb={'vod' if vod else 'live'} | ref={ref} | proxy={'tak' if proxy else 'nie'}")
     await page.goto(url, wait_until="domcontentloaded", timeout=45000, referer=ref)
 
-    selector = "#replayGrid .rcard, #rseries .rcard" if vod else "#playerBox video, #list .ev"
+    base_sel = "#rseries .rcard, #replayGrid .rcard" if vod else "#list .ev"
     try:
-        await page.wait_for_selector(selector, timeout=20000)
+        await page.wait_for_selector(base_sel, timeout=25000)
     except Exception:
-        log(f"[{idx}] oczekiwany element nie pojawił się w 20s")
+        log(f"[{idx}] lista nie pojawiła się w 25s")
 
     await page.wait_for_timeout(random.randint(3000, 6000))
+
+    if vod:
+        await start_episode(page)
+        try:
+            await page.wait_for_selector("#playerBox video", timeout=15000)
+        except Exception:
+            log(f"[{idx}] brak elementu video po wejściu w odcinek")
+
     await try_unmute(page)
     await jiggle_mouse(page)
-
-    pos = await playback_pos(page)
-    log(f"[{idx}] currentTime wideo: {pos}s")
+    log(f"[{idx}] currentTime wideo: {await playback_pos(page)}s")
 
     await page.wait_for_timeout(random.randint(10000, 25000))
     await human_scroll(page)
@@ -266,9 +299,8 @@ async def visit(browser, idx):
         await try_click(page)
         await page.wait_for_timeout(random.randint(4000, 9000))
 
-    # głębsze wejścia
     while steps < MAX_SWITCHES and random.random() < SWITCH_RATE:
-        ok = await open_vod_item(page) if vod else await switch_channel(page)
+        ok = await start_episode(page) if vod else await switch_channel(page)
         if not ok:
             break
         steps += 1
@@ -285,7 +317,12 @@ async def visit(browser, idx):
     for sel in ("#navAd", "#sideAd"):
         try:
             el = await page.query_selector(sel)
-            slots[sel] = bool(el and (await el.inner_html()).strip()) if el else False
+            if el:
+                inner = (await el.inner_html()).strip()
+                frames = await el.query_selector_all("iframe")
+                slots[sel] = bool(inner) or bool(frames)
+            else:
+                slots[sel] = False
         except Exception:
             slots[sel] = False
     ad_frames = [f for f in page.frames if any(p in (f.url or "").lower() for p in AD_PATTERNS)]
@@ -310,6 +347,7 @@ async def main():
             headless=HEADLESS,
             args=[
                 "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
                 "--autoplay-policy=no-user-gesture-required",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
