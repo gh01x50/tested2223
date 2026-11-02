@@ -1,0 +1,65 @@
+name: strimek-visits
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+    - cron: "0 3 1 * *"
+  push:
+    branches: [main]
+    paths-ignore:
+      - ".keepalive"
+  workflow_dispatch:
+    inputs:
+      visits:
+        description: "Liczba wejść w tym przebiegu"
+        default: "3"
+concurrency:
+  group: strimek-visits
+  cancel-in-progress: false
+
+jobs:
+  visit:
+    if: github.event.schedule != '0 3 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - name: Run
+        env:
+          VISITS: ${{ github.event.inputs.visits || '3' }}
+          CLICK_RATE: "0.75"
+          SWITCH_RATE: "0.55"
+          MAX_SWITCHES: "3"
+          PROXY_LIST: ${{ secrets.PROXY_LIST }}
+          HEADLESS: "0"
+        run: xvfb-run -a python bot.py
+      - name: Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shots-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 3
+          if-no-files-found: ignore
+
+  keepalive:
+    if: github.event.schedule == '0 3 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: date -u >> .keepalive
+      - run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add .keepalive
+          git commit -m "keepalive" || exit 0
+          git push
